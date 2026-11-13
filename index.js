@@ -1243,11 +1243,13 @@ async function digestOne(cfg, entry, hours, signal) {
   }
   const stamp = new Date().toISOString()
   const withTs = messages.filter((m) => m && m.ts).length
-  const timeMode = withTs === 0 ? "snapshot" : "window"
+  const timeMode = withTs === 0 ? "snapshot" : withTs < messages.length ? "mixed" : "window"
   const scopeLine =
     timeMode === "snapshot"
       ? `无时间戳（导出未含时间）：覆盖该会话已导入的全部 ${messages.length} 条，按导入顺序`
-      : `窗口 ${hours}h · 覆盖 ${messages.length} 条`
+      : timeMode === "mixed"
+        ? `部分消息有时间戳（${withTs}/${messages.length} 条）：窗口 ${hours}h 内 + 无法定时的行一并纳入，后者未按时间过滤`
+        : `窗口 ${hours}h · 覆盖 ${messages.length} 条`
   const body = [`# ${chatName} · 摘要`, "", `> 由 ${cfg.digestModel} 生成 · 输入 ${messages.length} 条 / ${chunks.length} 块 · 确定性校验通过 ${chunks.length - failed}/${chunks.length}`, `> ${scopeLine} · 生成时间 ${stamp}`, `> 来源 ${file}`, ""]
   body.push(`## 重要通知（原句照抄，未改写）${verified.alerts.length === 0 ? "（无）" : ""}`)
   for (const alert of verified.alerts) body.push(`- ${refLabel(alert)} ${alert.sender ?? "?"}: ${quoteLines(alert.text)}`)

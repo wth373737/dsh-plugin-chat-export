@@ -13,7 +13,8 @@ import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 
 import { loadSchemastery } from './lib/schema.js'
-import { chatNameFromFile, parseChatText, parseJsonExport, slugOfName } from './lib/adapters/whatsapp.mjs'
+import { chatNameFromFile, fingerprint, parseChatText, parseJsonExport, parsePrePlain, slugOfName } from './lib/adapters/whatsapp.mjs'
+import { closeSession, openChatByName, openSession, probeDom, probeMessages, scrapeRows, screenshot, scrollMessagesUp, sessionState, sessionStatus, waitForMessages } from './lib/adapters/whatsapp-web.mjs'
 
 export const inject = ['tools', 'commands', 'webServer', 'settings']
 
@@ -36,6 +37,8 @@ function buildConfig(Schema) {
     digestModel: Schema.string().default('qwen2.5:7b').description('生成摘要所用的本地 Ollama 模型 tag。'),
     ollamaUrl: Schema.string().default('http://127.0.0.1:11434').description('本地 Ollama 地址。'),
     waInbox: Schema.string().default('').description('WhatsApp 导出文件的收件箱目录。留空则用数据目录下的 wa-inbox，也可在设置页里改。'),
+    waChrome: Schema.string().default('').description('用于 WhatsApp Web 的 Chrome 可执行文件路径。留空则用系统默认路径。'),
+    waProfile: Schema.string().default('').description('持久 Chrome profile 目录（保存 WhatsApp Web 登录态）。留空则用数据目录下的 wa-profile。'),
     digestConcurrency: Schema.number()
       .default(2)
       .description('摘要并发的本地模型请求数。受本机资源预算约束，默认 2，不建议调高。'),
@@ -985,6 +988,14 @@ async function handleUiRequest(req, res, ctx, cfg) {
       savePolicy(policy)
       return sendJson(res, 200, uiSnapshot(loadPolicy(), cfg))
     }
+    if (action === "setWa") {
+      const patch = {}
+      if (typeof payload.profile === "string") patch.waProfile = payload.profile.trim()
+      if (typeof payload.chrome === "string") patch.waChrome = payload.chrome.trim()
+      writeOverrides(patch)
+      return sendJson(res, 200, uiSnapshot(loadPolicy(), cfg))
+    }
+
     if (action === "setInbox") {
       writeOverrides({ inboxDir: String(payload.value ?? "").trim() })
       return sendJson(res, 200, uiSnapshot(loadPolicy(), cfg))
@@ -1384,6 +1395,63 @@ function appendEntries(file, records) {
 }
 
 /** 导入一批文件：工具与页面共用同一段逻辑，不写第二套。 */
+/** 内容级合并键：同一句话在不同来源（无时间戳的导出 / 有时间的抓取）应当合并。 */
+function contentKeyOf(record) {
+  const text = String(record?.text ?? "").replace(/\s+/g, " ").trim().toLowerCase()
+  return [record?.chat_id ?? "", String(record?.sender_name ?? "").trim().toLowerCase(), text].join("\u0001")
+}
+
+/**
+ * 按内容合并写入：
+ * - 内容已存在且有 ts：跳过（计数为 duplicate）
+ * - 内容已存在但没有 ts、而新行有 ts：补上 ts（计数为 upgraded）
+ * - 内容不存在：追加
+ */
+function upsertMessages(file, records) {
+  const rows = []
+  const index = new Map()
+  if (existsSync(file)) {
+    for (const line of readFileSync(file, "utf8").split(NL)) {
+      if (line.trim().length === 0) continue
+      try {
+        const row = JSON.parse(line)
+        rows.push(row)
+        index.set(contentKeyOf(row), rows.length - 1)
+      } catch {
+        continue
+      }
+    }
+  }
+  let added = 0
+  let upgraded = 0
+  let duplicate = 0
+  let dirty = false
+  const fresh = []
+  for (const record of records) {
+    const key = contentKeyOf(record)
+    const at = index.get(key)
+    if (at === undefined) {
+      rows.push(record)
+      index.set(key, rows.length - 1)
+      fresh.push(JSON.stringify(record))
+      added += 1
+      continue
+    }
+    const existing = rows[at]
+    if (!existing.ts && record.ts) {
+      existing.ts = record.ts
+      existing.uid = record.uid || existing.uid
+      existing.raw_ref = record.raw_ref || existing.raw_ref
+      dirty = true
+      upgraded += 1
+      continue
+    }
+    duplicate += 1
+  }
+  if (dirty) writeFileSync(file, rows.map((row) => JSON.stringify(row)).join(NL) + NL, "utf8")
+  if (fresh.length > 0) appendFileSync(file, fresh.join(NL) + NL, "utf8")
+  return { added, dup: duplicate, upgraded }
+}
 async function importFiles(cfg, files) {
   const policy = loadPolicy()
   const results = []
@@ -1490,6 +1558,181 @@ function importTool(ctx, cfg) {
     },
   }
 }
+/* ------------------------------------------------------------------ WhatsApp Web */
+
+function chromeOf(cfg) {
+  const direct = String(cfg.waChrome ?? "").trim()
+  if (direct.length > 0) return direct
+  const stored = String(readOverrides().waChrome ?? "").trim()
+  if (stored.length > 0) return stored
+  return "C:\\\\Program Files\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe"
+}
+
+function waProfileOf(cfg) {
+  const direct = String(cfg.waProfile ?? "").trim()
+  if (direct.length > 0) return direct
+  const stored = String(readOverrides().waProfile ?? "").trim()
+  if (stored.length > 0) return stored
+  return join(stateDir(), "wa-profile")
+}
+
+function webTool(ctx, cfg, kind) {
+  const base = { output: { schema: { type: "object", additionalProperties: true }, render: (_a, v) => [{ type: "text", text: typeof v?.text === "string" ? v.text : JSON.stringify(v, null, 2) }] } }
+  if (kind === "open") {
+    return {
+      ...base,
+      name: "wa_open",
+      description: "启动一个独立的持久 Chrome（不影响日常浏览器）并打开 WhatsApp Web。已登录会直接进入主界面；未登录会停在扫码页，请在那个窗口里扫一次码。",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+      async execute() {
+        const profileDir = waProfileOf(cfg)
+        mkdirSync(profileDir, { recursive: true })
+        await openSession({ chromePath: chromeOf(cfg), profileDir })
+        const status = await sessionStatus(kind === "open" ? 45000 : 0)
+        return { ok: true, ...status, profile: profileDir, text: status.loggedIn ? `已打开并登录：${status.url}` : `已打开 ${status.url}，请在窗口里扫码登录（首次）。扫码后调用 wa_probe 侦察页面结构。` }
+      },
+    }
+  }
+  if (kind === "sync") {
+    return {
+      ...base,
+      name: "wa_sync",
+      description: "在已登录的 WhatsApp Web 里打开指定会话，向上滚动加载历史并抓取消息（时间、发送者、正文），写入同一份归一化存储。只读，不发送任何消息。会话必须已在白名单里。",
+      parameters: {
+        type: "object",
+        properties: {
+          chat: { type: "string", description: "会话名称，与左侧列表显示一致。" },
+          scrolls: { type: "integer", description: "向上滚动加载的次数，默认 8，上限 60。越多越能取到更早的历史，也越慢。" },
+        },
+        required: ["chat"],
+        additionalProperties: false,
+      },
+      async execute(args) {
+        const status = await sessionStatus(0)
+        if (!status.open) throw new Error("浏览器还没打开，先调用 wa_open")
+        if (!status.loggedIn) throw new Error("还没登录：请先在打开的窗口里扫码")
+        const chatName = String(args?.chat || "").trim()
+        if (chatName.length === 0) throw new Error("需要 chat")
+        const opened = await openChatByName(chatName)
+        if (!opened) throw new Error(`打不开会话：${chatName}`)
+        await waitForMessages(3, 30000)
+        const scrolls = Math.max(0, Math.min(60, Number(args?.scrolls) || 8))
+        const seen = new Map()
+        const collect = async () => {
+          const rows = await scrapeRows()
+          for (const row of rows) {
+            const key = row.id || `${row.testid}|${String(row.text).slice(0, 40)}`
+            if (!seen.has(key)) seen.set(key, row)
+          }
+        }
+        await collect()
+        for (let i = 0; i < scrolls; i += 1) {
+          await scrollMessagesUp(1)
+          await collect()
+        }
+        const policy = loadPolicy()
+        const slug = slugOfName(chatName)
+        const chatKey = keyOf("wa", slug)
+        const entry = policy.chats[chatKey]
+        if (!entry || entry.decision !== "allow") {
+          policy.chats[chatKey] = { ...(entry || {}), platform: "wa", id: slug, name: chatName, decision: entry?.decision === "deny" ? "deny" : "pending", seen_at: new Date().toISOString() }
+          savePolicy(policy)
+          return { ok: false, chat: chatName, text: `${chatName} 未获批准，已登记为待批准；没有写入任何内容。` }
+        }
+        const records = []
+        let skipped = 0
+        for (const row of seen.values()) {
+          const parsed = parsePrePlain(row.pre)
+          if (!parsed) {
+            skipped += 1
+            continue
+          }
+          const text = String(row.text || parsed.body || "").trim()
+          if (text.length === 0) {
+            skipped += 1
+            continue
+          }
+          records.push({
+            platform: "wa",
+            chat_id: chatKey,
+            chat_name: chatName,
+            msg_id: null,
+            uid: fingerprint("wa", chatKey, parsed.iso, parsed.sender || "", text),
+            ts: parsed.iso,
+            sender_id: null,
+            sender_name: parsed.sender,
+            kind: "text",
+            text,
+            reply_to: null,
+            attachments: [],
+            captured_at: new Date().toISOString(),
+            raw_ref: { source: "wa-web" },
+          })
+        }
+        const dir = join(outputRootOf(cfg), slug)
+        mkdirSync(dir, { recursive: true })
+        const outFile = join(dir, "messages.jsonl")
+        const { added, dup, upgraded } = upsertMessages(outFile, records)
+        record(policy, { op: "sync", chat: chatKey, result: `added:${added}` })
+        savePolicy(policy)
+        return { ok: true, chat: chatName, scrolls, rows_seen: seen.size, parsed: records.length, skipped, added, upgraded, duplicates: dup, path: outFile }
+      },
+    }
+  }
+
+  if (kind === "chatProbe") {
+    return {
+      ...base,
+      name: "wa_chat_probe",
+      description: "在已登录的 WhatsApp Web 里用搜索框打开指定会话，并侦察其消息节点结构（只报标签与属性名，不回正文）。",
+      parameters: { type: "object", properties: { chat: { type: "string", description: "会话名称，与左侧列表显示一致。" } }, required: ["chat"], additionalProperties: false },
+      async execute(args) {
+        const status = await sessionStatus(0)
+        if (!status.open) throw new Error("浏览器还没打开，先调用 wa_open")
+        if (!status.loggedIn) throw new Error("还没登录：请先在打开的窗口里扫码")
+        const opened = await openChatByName(String(args.chat || ""))
+        if (!opened) return { ok: false, text: `没能打开会话「${args.chat}」：搜索后没有进入主界面，换个更精确的名字试试。` }
+        const loaded = await waitForMessages(3, 30000)
+        const info = await probeMessages()
+        const dir = join(stateDir(), "wa-shots")
+        mkdirSync(dir, { recursive: true })
+        const shot = join(dir, `probe-${Date.now()}.png`)
+        try {
+          await screenshot(shot)
+        } catch {
+          // 截图失败不影响侦察结果
+        }
+        return { ok: true, chat: args.chat, loaded, title: info.title, hist: info.hist, dataIds: info.dataIds, probes: info.out, shot }
+      },
+    }
+  }
+
+  if (kind === "probe") {
+    return {
+      ...base,
+      name: "wa_probe",
+      description: "侦察 WhatsApp Web 当前页面的 DOM 结构（各候选选择器的命中数与样例），用于校准抓取器。只读，不发送任何消息。",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+      async execute() {
+        const status = await sessionStatus(kind === "open" ? 45000 : 0)
+        if (!status.open) throw new Error("浏览器还没打开，先调用 wa_open")
+        if (!status.loggedIn) return { ok: false, ...status, text: "还没登录：请在打开的窗口里扫码，然后再调用 wa_probe。" }
+        const probes = await probeDom()
+        return { ok: true, loggedIn: status.loggedIn, url: status.url, probes }
+      },
+    }
+  }
+  return {
+    ...base,
+    name: "wa_close",
+    description: "关闭由插件启动的那个 Chrome 实例（只关自己启动的，不动你日常浏览器）。",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    async execute() {
+      const closed = await closeSession()
+      return { ok: true, closed, text: closed ? "已关闭插件启动的浏览器。" : "没有由插件启动的浏览器在运行。" }
+    },
+  }
+}
 /* ------------------------------------------------------------------ 装配 */
 
 export function apply(ctx, config = {}) {
@@ -1501,6 +1744,8 @@ export function apply(ctx, config = {}) {
     digestModel: config.digestModel ?? 'qwen2.5:7b',
     ollamaUrl: config.ollamaUrl ?? 'http://127.0.0.1:11434',
     waInbox: config.waInbox ?? '',
+    waChrome: config.waChrome ?? '',
+    waProfile: config.waProfile ?? '',
     digestConcurrency: config.digestConcurrency ?? 2,
     requestDelay: config.requestDelay ?? 1.5,
     maxMessagesPerFetch: config.maxMessagesPerFetch ?? 5000,
@@ -1522,6 +1767,11 @@ export function apply(ctx, config = {}) {
   ctx.tools.register(loginTool(ctx, cfg))
   ctx.tools.register(digestTool(ctx, cfg))
   ctx.tools.register(importTool(ctx, cfg))
+  ctx.tools.register(webTool(ctx, cfg, 'open'))
+  ctx.tools.register(webTool(ctx, cfg, 'probe'))
+  ctx.tools.register(webTool(ctx, cfg, 'chatProbe'))
+  ctx.tools.register(webTool(ctx, cfg, 'sync'))
+  ctx.tools.register(webTool(ctx, cfg, 'close'))
   ctx.tools.guard(makeGuard())
   // 设置页不会自己出现：必须显式登记页面策略（auto: true 表示按 Config schema 自动生成表单）。
   const settingsHost = ctx.settings

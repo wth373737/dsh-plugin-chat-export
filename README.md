@@ -109,8 +109,13 @@ WhatsApp 的重消息是：**只有文本气泡带 `data-pre-plain-text`**（时
 
 ## 定时
 
-用 task board 的定时卡片驱动（不自建守护进程）：每天固定时间
-`chat_list → chat_fetch(days=1) → chat_digest(hours=24)`。
+用 task board 的定时卡片驱动（不自建守护进程）。每天固定时间按平台取数，最后统一出摘要：
+
+- Telegram：`chat_list → chat_fetch(days=1)`（逐群，或按需扩成批量）
+- WhatsApp：`chat_import`（扫收件箱）与/或 `wa_sync(hours=24)`，看用的是哪条通路
+- 收尾：`chat_digest(hours=24)`，失败项照实报告，不要重试刷屏
+
+WhatsApp 的 `wa_sync` 依赖那个持久 Chrome 处于登录态；Chrome 没开或掉登录时，卡片应当报错而不是静默产出空摘要。
 
 ## 目录结构
 

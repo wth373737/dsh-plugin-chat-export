@@ -13,7 +13,7 @@ import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 
 import { loadSchemastery } from './lib/schema.js'
-import { chatNameFromFile, parseChatText, slugOfName } from './lib/adapters/whatsapp.mjs'
+import { chatNameFromFile, parseChatText, parseJsonExport, slugOfName } from './lib/adapters/whatsapp.mjs'
 
 export const inject = ['tools', 'commands', 'webServer', 'settings']
 
@@ -1103,6 +1103,14 @@ async function mapLimit(items, limit, worker) {
   return results
 }
 
+function refLabel(item) {
+  const when = item && item.ts ? ` · ${String(item.ts).slice(0, 16)}` : ""
+  return `[${item.ref}${when}]`
+}
+
+function quoteLines(value) {
+  return String(value ?? "").split(NL).join(NL + "  ")
+}
 function refOf(message) {
   if (message && message.msg_id !== null && message.msg_id !== undefined) return `msg ${message.msg_id}`
   return `uid ${String(message?.uid ?? "").slice(0, 8) || "?"}`
@@ -1169,7 +1177,8 @@ async function digestOne(cfg, entry, hours, signal) {
   if (messages.length === 0) {
     return { chat: chatName, path: null, source: file, messages: 0, chunks: 0, ok_chunks: 0, failed_chunks: 0, alerts: 0, links: 0, rejected_alerts: 0, text: "窗口内没有消息，未生成摘要。" }
   }
-  const chunks = chunkMessages(chunkLines(messages), 6000)
+  // 块越小，7B 越不容易产出畸形 JSON；宁可多几块，也不要整块丢失。
+  const chunks = chunkMessages(chunkLines(messages), 3000)
   const concurrency = Math.max(1, Math.min(4, Number(cfg.digestConcurrency) || 2))
   const extracts = await mapLimit(chunks, concurrency, async (chunk) => {
     try {
@@ -1192,9 +1201,15 @@ async function digestOne(cfg, entry, hours, signal) {
     summary = `（归并失败：${String(error?.message ?? error)}）`
   }
   const stamp = new Date().toISOString()
-  const body = [`# ${chatName} · 摘要`, "", `> 由 ${cfg.digestModel} 生成 · 输入 ${messages.length} 条 / ${chunks.length} 块 · 确定性校验通过 ${ok.length}/${chunks.length}`, `> 生成时间 ${stamp} · 窗口 ${hours}h · 来源 ${file}`, ""]
+  const withTs = messages.filter((m) => m && m.ts).length
+  const timeMode = withTs === 0 ? "snapshot" : "window"
+  const scopeLine =
+    timeMode === "snapshot"
+      ? `无时间戳（导出未含时间）：覆盖该会话已导入的全部 ${messages.length} 条，按导入顺序`
+      : `窗口 ${hours}h · 覆盖 ${messages.length} 条`
+  const body = [`# ${chatName} · 摘要`, "", `> 由 ${cfg.digestModel} 生成 · 输入 ${messages.length} 条 / ${chunks.length} 块 · 确定性校验通过 ${ok.length}/${chunks.length}`, `> ${scopeLine} · 生成时间 ${stamp}`, `> 来源 ${file}`, ""]
   body.push(`## 重要通知（原句照抄，未改写）${verified.alerts.length === 0 ? "（无）" : ""}`)
-  for (const alert of verified.alerts) body.push(`- [${alert.ref} · ${String(alert.ts ?? "").slice(0, 16)}] ${alert.sender ?? "?"}: ${alert.text}`)
+  for (const alert of verified.alerts) body.push(`- ${refLabel(alert)} ${alert.sender ?? "?"}: ${quoteLines(alert.text)}`)
   body.push("")
   body.push(`## 链接（代码提取）${links.length === 0 ? "（无）" : ""}`)
   for (const link of links) body.push(`- [${link.ref}] ${link.url}`)
@@ -1204,7 +1219,7 @@ async function digestOne(cfg, entry, hours, signal) {
   body.push(summary)
   body.push("")
   body.push(`## 可能有待确认（未逐条核实；附原文出处）${verifiedQuestions.questions.length === 0 ? "（无）" : ""}`)
-  for (const q of verifiedQuestions.questions) body.push(`- [${q.ref} · ${String(q.ts ?? "").slice(0, 16)}] ${q.sender ?? "?"}: ${q.text}`)
+  for (const q of verifiedQuestions.questions) body.push(`- ${refLabel(q)} ${q.sender ?? "?"}: ${quoteLines(q.text)}`)
   body.push("")
   if (failed > 0 || verified.rejected > 0 || verifiedQuestions.rejected > 0) {
     body.push("## 校验记录")
@@ -1220,7 +1235,7 @@ async function digestOne(cfg, entry, hours, signal) {
   return {
     chat: chatName, path: outPath, messages: messages.length, chunks: chunks.length,
     ok_chunks: ok.length, failed_chunks: failed, alerts: verified.alerts.length,
-    rejected_alerts: verified.rejected, links: links.length, questions: verifiedQuestions.questions.length, chars: summary.length,
+    rejected_alerts: verified.rejected, links: links.length, questions: verifiedQuestions.questions.length, time_mode: timeMode, chars: summary.length,
     alert_preview: verified.alerts.slice(0, 3).map((a) => `[${a.ref}] ${a.text}`.slice(0, 160)),
     preview: summary.slice(0, 400),
   }
@@ -1285,7 +1300,7 @@ function inboxDirOf(cfg) {
 function listInboxFiles(dir) {
   try {
     return readdirSync(dir, { withFileTypes: true })
-      .filter((entry) => entry.isFile() && /\.(zip|txt)$/i.test(entry.name))
+      .filter((entry) => entry.isFile() && /\.(zip|txt|json)$/i.test(entry.name))
       .map((entry) => join(dir, entry.name))
   } catch {
     return []
@@ -1370,7 +1385,17 @@ function importTool(ctx, cfg) {
       const results = []
       for (const file of files) {
         try {
-          const name = chatNameFromFile(basename(file))
+          const isJson = /\.json$/i.test(file)
+          const rawText = isJson ? readFileSync(file, "utf8") : null
+          let name = ""
+          if (isJson) {
+            try {
+              name = parseJsonExport(rawText, { platform: "wa", chatKey: "" }).chatName
+            } catch {
+              name = ""
+            }
+          }
+          if (name.length === 0) name = chatNameFromFile(basename(file))
           const slug = slugOfName(name)
           const chatKey = keyOf("wa", slug)
           const existing = policy.chats[chatKey]
@@ -1389,8 +1414,9 @@ function importTool(ctx, cfg) {
             results.push({ file: basename(file), chat: name, status: denied ? "denied" : "pending-approval" })
             continue
           }
-          const text = await readExportText(file)
-          const parsed = parseChatText(text, { platform: "wa", chatKey })
+          const text = isJson ? rawText : await readExportText(file)
+          const parsed = isJson ? parseJsonExport(text, { platform: "wa", chatKey }) : parseChatText(text, { platform: "wa", chatKey })
+          const capturedAt = parsed.exportedAt || null
           const dir = join(outputRootOf(cfg), slug)
           mkdirSync(dir, { recursive: true })
           const outFile = join(dir, "messages.jsonl")
@@ -1407,7 +1433,8 @@ function importTool(ctx, cfg) {
             text: m.text,
             reply_to: null,
             attachments: [],
-            raw_ref: { source: "wa-export" },
+            captured_at: capturedAt,
+            raw_ref: { source: isJson ? "wa-json" : "wa-export" },
           }))
           const { added, dup } = appendEntries(outFile, recordsToWrite)
           const processed = join(dirname(file), "processed")

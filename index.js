@@ -5,14 +5,15 @@
  * 门禁由插件自身完成，不依赖 Agent 自觉，也不依赖 tools/pre-execute 的判断。
  * guard 只负责堵住"绕过插件直调通道"与"读凭据/改策略库"这两类旁路。
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { execFile } from 'node:child_process'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 
 import { loadSchemastery } from './lib/schema.js'
+import { chatNameFromFile, parseChatText, slugOfName } from './lib/adapters/whatsapp.mjs'
 
 export const inject = ['tools', 'commands', 'webServer', 'settings']
 
@@ -34,6 +35,7 @@ function buildConfig(Schema) {
       .description('record-only 只记录附件位置与 id，需要时再补下；download 导出时同时下载媒体文件。'),
     digestModel: Schema.string().default('qwen2.5:7b').description('生成摘要所用的本地 Ollama 模型 tag。'),
     ollamaUrl: Schema.string().default('http://127.0.0.1:11434').description('本地 Ollama 地址。'),
+    waInbox: Schema.string().default('').description('WhatsApp 导出文件的收件箱目录。留空则用数据目录下的 wa-inbox，也可在设置页里改。'),
     digestConcurrency: Schema.number()
       .default(2)
       .description('摘要并发的本地模型请求数。受本机资源预算约束，默认 2，不建议调高。'),
@@ -495,6 +497,17 @@ function listTool(ctx, cfg) {
         }
       })
       mapped.sort((a, b) => String(b.last_ts ?? '').localeCompare(String(a.last_ts ?? '')))
+      // 导入式平台的会话不来自通道，而来自策略库本身；否则批准过的 WhatsApp 群不会出现。
+      for (const [key, entry] of Object.entries(policy.chats)) {
+        if (normalizePlatform(entry?.platform ?? splitKey(key)[0]) === "tg") continue
+        mapped.push({
+          id: String(entry?.id ?? splitKey(key)[1]),
+          name: String(entry?.name ?? ""),
+          kind: "import",
+          last_ts: entry?.cursor?.ts ?? null,
+          policy: entry?.decision === "allow" ? "allow" : entry?.decision === "deny" ? "deny" : "ask",
+        })
+      }
       const limit = Math.max(1, Math.min(500, Number(args?.limit) || 40))
       const chats = mapped.slice(0, limit)
       return {
@@ -619,7 +632,7 @@ function fetchTool(ctx, cfg) {
         return { ok: false, status: 'pending-approval', chat: key, name: pending.name || raw }
       }
       const [platform, id] = splitKey(key)
-      if (normalizePlatform(platform) !== 'tg') throw new Error(`chat_fetch: 当前只支持 telegram，收到 ${platform}`)
+      if (normalizePlatform(platform) !== 'tg') throw new Error('chat_fetch: WhatsApp 会话是导入式的，不支持主动拉取。请用 chat_import 导入官方导出文件（.zip 或 .txt）。')
 
       const days = Math.max(1, Number(args?.days) || cfg.defaultDays || 7)
       const max = Math.max(1, Number(args?.max) || cfg.maxMessagesPerFetch || 5000)
@@ -1090,6 +1103,11 @@ async function mapLimit(items, limit, worker) {
   return results
 }
 
+function refOf(message) {
+  if (message && message.msg_id !== null && message.msg_id !== undefined) return `msg ${message.msg_id}`
+  return `uid ${String(message?.uid ?? "").slice(0, 8) || "?"}`
+}
+
 function verifyAlerts(messages, extracts) {
   const alerts = []
   let rejected = 0
@@ -1107,7 +1125,7 @@ function verifyAlerts(messages, extracts) {
         continue
       }
       if (alerts.some((a) => a.msg_id === hit.msg_id)) continue
-      alerts.push({ msg_id: hit.msg_id, ts: hit.ts, sender: hit.sender_name, text: String(hit.text ?? "").trim() })
+      alerts.push({ msg_id: hit.msg_id, ref: refOf(hit), ts: hit.ts, sender: hit.sender_name, text: String(hit.text ?? "").trim() })
     }
   }
   alerts.sort((a, b) => (a.msg_id > b.msg_id ? 1 : -1))
@@ -1118,7 +1136,7 @@ function extractLinks(messages) {
   const links = []
   for (const m of messages) {
     const found = String(m.text ?? "").match(URL_RE) ?? []
-    for (const url of found) links.push({ msg_id: m.msg_id, url })
+    for (const url of found) links.push({ msg_id: m.msg_id, ref: refOf(m), url })
   }
   return links
 }
@@ -1139,7 +1157,7 @@ function verifyQuestions(messages, extracts) {
         continue
       }
       if (out.some((q) => q.msg_id === hit.msg_id)) continue
-      out.push({ msg_id: hit.msg_id, ts: hit.ts, sender: hit.sender_name, text: String(hit.text ?? "").trim() })
+      out.push({ msg_id: hit.msg_id, ref: refOf(hit), ts: hit.ts, sender: hit.sender_name, text: String(hit.text ?? "").trim() })
     }
   }
   out.sort((a, b) => (a.msg_id > b.msg_id ? 1 : -1))
@@ -1176,17 +1194,17 @@ async function digestOne(cfg, entry, hours, signal) {
   const stamp = new Date().toISOString()
   const body = [`# ${chatName} · 摘要`, "", `> 由 ${cfg.digestModel} 生成 · 输入 ${messages.length} 条 / ${chunks.length} 块 · 确定性校验通过 ${ok.length}/${chunks.length}`, `> 生成时间 ${stamp} · 窗口 ${hours}h · 来源 ${file}`, ""]
   body.push(`## 重要通知（原句照抄，未改写）${verified.alerts.length === 0 ? "（无）" : ""}`)
-  for (const alert of verified.alerts) body.push(`- [msg ${alert.msg_id} · ${String(alert.ts ?? "").slice(0, 16)}] ${alert.sender ?? "?"}: ${alert.text}`)
+  for (const alert of verified.alerts) body.push(`- [${alert.ref} · ${String(alert.ts ?? "").slice(0, 16)}] ${alert.sender ?? "?"}: ${alert.text}`)
   body.push("")
   body.push(`## 链接（代码提取）${links.length === 0 ? "（无）" : ""}`)
-  for (const link of links) body.push(`- [msg ${link.msg_id}] ${link.url}`)
+  for (const link of links) body.push(`- [${link.ref}] ${link.url}`)
   body.push("")
   body.push("## 概要（模型生成，请结合上方原文核对）")
   body.push("")
   body.push(summary)
   body.push("")
   body.push(`## 可能有待确认（未逐条核实；附原文出处）${verifiedQuestions.questions.length === 0 ? "（无）" : ""}`)
-  for (const q of verifiedQuestions.questions) body.push(`- [msg ${q.msg_id} · ${String(q.ts ?? "").slice(0, 16)}] ${q.sender ?? "?"}: ${q.text}`)
+  for (const q of verifiedQuestions.questions) body.push(`- [${q.ref} · ${String(q.ts ?? "").slice(0, 16)}] ${q.sender ?? "?"}: ${q.text}`)
   body.push("")
   if (failed > 0 || verified.rejected > 0 || verifiedQuestions.rejected > 0) {
     body.push("## 校验记录")
@@ -1203,7 +1221,7 @@ async function digestOne(cfg, entry, hours, signal) {
     chat: chatName, path: outPath, messages: messages.length, chunks: chunks.length,
     ok_chunks: ok.length, failed_chunks: failed, alerts: verified.alerts.length,
     rejected_alerts: verified.rejected, links: links.length, questions: verifiedQuestions.questions.length, chars: summary.length,
-    alert_preview: verified.alerts.slice(0, 3).map((a) => `[msg ${a.msg_id}] ${a.text}`.slice(0, 160)),
+    alert_preview: verified.alerts.slice(0, 3).map((a) => `[${a.ref}] ${a.text}`.slice(0, 160)),
     preview: summary.slice(0, 400),
   }
 }
@@ -1254,6 +1272,162 @@ function digestTool(ctx, cfg) {
     },
   }
 }
+/* ------------------------------------------------------------------ WhatsApp 导入 */
+
+function inboxDirOf(cfg) {
+  const configured = String(cfg.waInbox ?? "").trim()
+  if (configured.length > 0) return configured
+  const stored = String(readOverrides().inboxDir ?? "").trim()
+  if (stored.length > 0) return stored
+  return join(stateDir(), "wa-inbox")
+}
+
+function listInboxFiles(dir) {
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && /\.(zip|txt)$/i.test(entry.name))
+      .map((entry) => join(dir, entry.name))
+  } catch {
+    return []
+  }
+}
+
+async function readExportText(file) {
+  if (/\.txt$/i.test(file)) return readFileSync(file, "utf8")
+  const work = join(stateDir(), "wa-import", String(Date.now()))
+  mkdirSync(work, { recursive: true })
+  await execFileAsync("tar", ["-xf", file, "-C", work], { timeout: 120000, windowsHide: true })
+  const found = []
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) walk(full)
+      else if (/\.txt$/i.test(entry.name)) found.push(full)
+    }
+  }
+  walk(work)
+  if (found.length === 0) throw new Error("压缩包里没有找到 txt 聊天文件")
+  return readFileSync(found[0], "utf8")
+}
+
+/** 按 uid 指纹去重追加：同一句消息只存一次，多次导出累积成完整历史。 */
+function appendEntries(file, records) {
+  const seen = new Set()
+  if (existsSync(file)) {
+    for (const line of readFileSync(file, "utf8").split(NL)) {
+      if (line.trim().length === 0) continue
+      try {
+        const row = JSON.parse(line)
+        if (row && row.uid) seen.add(String(row.uid))
+      } catch {
+        continue
+      }
+    }
+  }
+  const fresh = []
+  let dup = 0
+  for (const record of records) {
+    if (seen.has(record.uid)) {
+      dup += 1
+      continue
+    }
+    seen.add(record.uid)
+    fresh.push(JSON.stringify(record))
+  }
+  if (fresh.length > 0) appendFileSync(file, fresh.join(NL) + NL, "utf8")
+  return { added: fresh.length, dup }
+}
+
+function importTool(ctx, cfg) {
+  return {
+    name: "chat_import",
+    description: "导入 WhatsApp 官方导出的聊天记录（.zip 或 .txt）。默认扫描收件箱；给了 path 就只导入那个文件。未获批准的会话只会登记为待批准而不导入。重复导入按内容指纹去重，不会产生重复消息。",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "可选：指定要导入的导出文件绝对路径。" },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: "object", additionalProperties: true },
+      render: (_args, value) => {
+        if (!Array.isArray(value.results)) return [{ type: "text", text: JSON.stringify(value, null, 2) }]
+        if (value.results.length === 0) return [{ type: "text", text: `收件箱为空：${value.inbox}` }]
+        const lines = value.results.map((item) => {
+          if (item.status === "imported") return `- ${item.chat}｜导入 ${item.added} 条（重复 ${item.duplicates}）｜产物 ${item.path}`
+          if (item.status === "failed") return `- ${item.file}｜失败：${item.error}`
+          return `- ${item.chat}｜${item.status === "denied" ? "在黑名单里，已跳过" : "待批准，未导入"}｜${item.file}`
+        })
+        return [{ type: "text", text: [`收件箱：${value.inbox}`, "", ...lines].join(NL) }]
+      },
+    },
+    async execute(args) {
+      const policy = loadPolicy()
+      const inbox = inboxDirOf(cfg)
+      const files = args?.path ? [String(args.path)] : listInboxFiles(inbox)
+      if (files.length === 0) return { ok: true, inbox, results: [] }
+      const results = []
+      for (const file of files) {
+        try {
+          const name = chatNameFromFile(basename(file))
+          const slug = slugOfName(name)
+          const chatKey = keyOf("wa", slug)
+          const existing = policy.chats[chatKey]
+          if (!existing || existing.decision !== "allow") {
+            const denied = existing && existing.decision === "deny"
+            policy.chats[chatKey] = {
+              ...(existing || {}),
+              platform: "wa",
+              id: slug,
+              name,
+              decision: denied ? "deny" : "pending",
+              seen_at: new Date().toISOString(),
+            }
+            record(policy, { op: "import", chat: chatKey, result: denied ? "denied" : "pending-approval" })
+            savePolicy(policy)
+            results.push({ file: basename(file), chat: name, status: denied ? "denied" : "pending-approval" })
+            continue
+          }
+          const text = await readExportText(file)
+          const parsed = parseChatText(text, { platform: "wa", chatKey })
+          const dir = join(outputRootOf(cfg), slug)
+          mkdirSync(dir, { recursive: true })
+          const outFile = join(dir, "messages.jsonl")
+          const recordsToWrite = parsed.messages.map((m) => ({
+            platform: "wa",
+            chat_id: chatKey,
+            chat_name: name,
+            msg_id: null,
+            uid: m.uid,
+            ts: m.ts,
+            sender_id: null,
+            sender_name: m.sender,
+            kind: m.kind,
+            text: m.text,
+            reply_to: null,
+            attachments: [],
+            raw_ref: { source: "wa-export" },
+          }))
+          const { added, dup } = appendEntries(outFile, recordsToWrite)
+          const processed = join(dirname(file), "processed")
+          try {
+            mkdirSync(processed, { recursive: true })
+            renameSync(file, join(processed, basename(file)))
+          } catch {
+            // 归档失败不影响导入结果
+          }
+          record(policy, { op: "import", chat: chatKey, result: `added:${added}` })
+          savePolicy(policy)
+          results.push({ file: basename(file), chat: name, status: "imported", parsed: parsed.stats, added, duplicates: dup, warnings: parsed.warnings.length, path: outFile })
+        } catch (error) {
+          results.push({ file: basename(file), status: "failed", error: String(error?.message ?? error).slice(0, 240) })
+        }
+      }
+      return { ok: true, inbox, results }
+    },
+  }
+}
 /* ------------------------------------------------------------------ 装配 */
 
 export function apply(ctx, config = {}) {
@@ -1264,6 +1438,7 @@ export function apply(ctx, config = {}) {
     mediaPolicy: config.mediaPolicy ?? 'record-only',
     digestModel: config.digestModel ?? 'qwen2.5:7b',
     ollamaUrl: config.ollamaUrl ?? 'http://127.0.0.1:11434',
+    waInbox: config.waInbox ?? '',
     digestConcurrency: config.digestConcurrency ?? 2,
     requestDelay: config.requestDelay ?? 1.5,
     maxMessagesPerFetch: config.maxMessagesPerFetch ?? 5000,
@@ -1284,6 +1459,7 @@ export function apply(ctx, config = {}) {
   )
   ctx.tools.register(loginTool(ctx, cfg))
   ctx.tools.register(digestTool(ctx, cfg))
+  ctx.tools.register(importTool(ctx, cfg))
   ctx.tools.guard(makeGuard())
   // 设置页不会自己出现：必须显式登记页面策略（auto: true 表示按 Config schema 自动生成表单）。
   const settingsHost = ctx.settings

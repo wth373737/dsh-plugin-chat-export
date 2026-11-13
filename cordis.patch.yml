@@ -1,0 +1,3 @@
+- insert:
+    - id: chat-export
+      name: '@local/chat-export'

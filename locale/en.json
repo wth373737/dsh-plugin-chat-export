@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Chat Export",
+    "description": "Read allowlisted group chats, normalize them to disk, and summarize with the local model. Unapproved conversations are never read."
+  }
+}

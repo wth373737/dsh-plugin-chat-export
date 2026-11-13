@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url'
 
 import { loadSchemastery } from './lib/schema.js'
 import { chatNameFromFile, fingerprint, parseChatText, parseJsonExport, parsePrePlain, slugOfName } from './lib/adapters/whatsapp.mjs'
-import { closeSession, openChatByName, openSession, probeDom, probeMessages, scrapeRows, screenshot, scrollMessagesUp, sessionState, sessionStatus, waitForMessages } from './lib/adapters/whatsapp-web.mjs'
+import { closeSession, openChatByName, openSession, probeDom, probeMessages, scrapeRows, screenshot, scrollStep, sessionState, sessionStatus, waitForMessages } from './lib/adapters/whatsapp-web.mjs'
 
 export const inject = ['tools', 'commands', 'webServer', 'settings']
 
@@ -1397,8 +1397,10 @@ function appendEntries(file, records) {
 /** 导入一批文件：工具与页面共用同一段逻辑，不写第二套。 */
 /** 内容级合并键：同一句话在不同来源（无时间戳的导出 / 有时间的抓取）应当合并。 */
 function contentKeyOf(record) {
+  // 只用「会话 + 正文」：导出里的自己显示为 You，抓取拿到的是手机号，
+  // 带上发送者会让同一句话配不上，反而产生重复。
   const text = String(record?.text ?? "").replace(/\s+/g, " ").trim().toLowerCase()
-  return [record?.chat_id ?? "", String(record?.sender_name ?? "").trim().toLowerCase(), text].join("\u0001")
+  return [record?.chat_id ?? "", text].join("\u0001")
 }
 
 /**
@@ -1407,6 +1409,38 @@ function contentKeyOf(record) {
  * - 内容已存在但没有 ts、而新行有 ts：补上 ts（计数为 upgraded）
  * - 内容不存在：追加
  */
+/** 归并同一文件内的重复行：优先保留带 ts 的那条，其余合并进它。 */
+function normalizeFile(file) {
+  if (!existsSync(file)) return { before: 0, after: 0, merged: 0 }
+  const lines = readFileSync(file, "utf8").split(NL).filter((line) => line.trim().length > 0)
+  const order = []
+  const rows = new Map()
+  for (const line of lines) {
+    let row
+    try {
+      row = JSON.parse(line)
+    } catch {
+      continue
+    }
+    const key = contentKeyOf(row)
+    const prev = rows.get(key)
+    if (!prev) {
+      rows.set(key, row)
+      order.push(key)
+      continue
+    }
+    if (!prev.ts && row.ts) {
+      prev.ts = row.ts
+      prev.uid = row.uid || prev.uid
+    }
+    if ((!prev.sender_name || prev.sender_name === "You") && row.sender_name && row.sender_name !== "You") {
+      prev.sender_name = row.sender_name
+    }
+  }
+  const text = order.map((key) => JSON.stringify(rows.get(key))).join(NL) + NL
+  writeFileSync(file, text, "utf8")
+  return { before: lines.length, after: order.length, merged: lines.length - order.length }
+}
 function upsertMessages(file, records) {
   const rows = []
   const index = new Map()
@@ -1597,12 +1631,14 @@ function webTool(ctx, cfg, kind) {
     return {
       ...base,
       name: "wa_sync",
-      description: "在已登录的 WhatsApp Web 里打开指定会话，向上滚动加载历史并抓取消息（时间、发送者、正文），写入同一份归一化存储。只读，不发送任何消息。会话必须已在白名单里。",
+      description:
+        "在已登录的 WhatsApp Web 里打开会话，按时间水位向上加载并抓取消息（时间、发送者、正文），写入同一份归一化存储。默认覆盖到 24 小时前、最多滚动 10 次；没覆盖完会明确报不完整。只读，不发送任何消息。",
       parameters: {
         type: "object",
         properties: {
           chat: { type: "string", description: "会话名称，与左侧列表显示一致。" },
-          scrolls: { type: "integer", description: "向上滚动加载的次数，默认 8，上限 60。越多越能取到更早的历史，也越慢。" },
+          hours: { type: "integer", description: "至少覆盖多少小时前，默认 24。" },
+          scrolls: { type: "integer", description: "最多滚动次数，默认 10，上限 30。" },
         },
         required: ["chat"],
         additionalProperties: false,
@@ -1613,73 +1649,130 @@ function webTool(ctx, cfg, kind) {
         if (!status.loggedIn) throw new Error("还没登录：请先在打开的窗口里扫码")
         const chatName = String(args?.chat || "").trim()
         if (chatName.length === 0) throw new Error("需要 chat")
-        const opened = await openChatByName(chatName)
-        if (!opened) throw new Error(`打不开会话：${chatName}`)
-        await waitForMessages(3, 30000)
-        const scrolls = Math.max(0, Math.min(60, Number(args?.scrolls) || 8))
-        const seen = new Map()
-        const collect = async () => {
-          const rows = await scrapeRows()
-          for (const row of rows) {
-            const key = row.id || `${row.testid}|${String(row.text).slice(0, 40)}`
-            if (!seen.has(key)) seen.set(key, row)
-          }
-        }
-        await collect()
-        for (let i = 0; i < scrolls; i += 1) {
-          await scrollMessagesUp(1)
-          await collect()
-        }
+
         const policy = loadPolicy()
         const slug = slugOfName(chatName)
         const chatKey = keyOf("wa", slug)
         const entry = policy.chats[chatKey]
         if (!entry || entry.decision !== "allow") {
-          policy.chats[chatKey] = { ...(entry || {}), platform: "wa", id: slug, name: chatName, decision: entry?.decision === "deny" ? "deny" : "pending", seen_at: new Date().toISOString() }
+          policy.chats[chatKey] = {
+            ...(entry || {}),
+            platform: "wa",
+            id: slug,
+            name: chatName,
+            decision: entry?.decision === "deny" ? "deny" : "pending",
+            seen_at: new Date().toISOString(),
+          }
           savePolicy(policy)
           return { ok: false, chat: chatName, text: `${chatName} 未获批准，已登记为待批准；没有写入任何内容。` }
         }
+
+        const opened = await openChatByName(chatName)
+        if (!opened) throw new Error(`打不开会话：${chatName}`)
+        await waitForMessages(3, 30000)
+
+        const hours = Math.max(1, Math.min(720, Number(args?.hours) || 24))
+        const maxScrolls = Math.max(0, Math.min(30, Number(args?.scrolls ?? 10)))
+        const targetFrom = Date.now() - hours * 3600 * 1000
+
+        const seen = new Map()
+        let oldest = null
+        const collect = async () => {
+          const rows = await scrapeRows()
+          for (const row of rows) {
+            const parsed = parsePrePlain(row.pre)
+            if (!parsed) continue
+            const text = String(row.text || parsed.body || "").trim()
+            if (text.length === 0) continue
+            const key = row.id || `${parsed.iso}|${parsed.sender ?? ""}|${text.slice(0, 40)}`
+            if (!seen.has(key)) seen.set(key, { iso: parsed.iso, sender: parsed.sender, text })
+            const stamp = Date.parse(parsed.iso)
+            if (Number.isFinite(stamp) && (oldest === null || stamp < oldest)) oldest = stamp
+          }
+          return rows.length
+        }
+
+        await collect()
+        let rounds = 0
+        let stopped = "covered"
+        while (rounds < maxScrolls) {
+          if (oldest !== null && oldest <= targetFrom) break
+          rounds += 1
+          const step = await scrollStep(500, 700)
+          await collect()
+          if (!step.loaded && step.atTop) {
+            stopped = "reached-top"
+            break
+          }
+        }
+        const complete = oldest !== null && oldest <= targetFrom
+        if (!complete) stopped = oldest === null ? "no-message" : rounds >= maxScrolls ? "max-scrolls" : stopped
+
         const records = []
-        let skipped = 0
-        for (const row of seen.values()) {
-          const parsed = parsePrePlain(row.pre)
-          if (!parsed) {
-            skipped += 1
-            continue
-          }
-          const text = String(row.text || parsed.body || "").trim()
-          if (text.length === 0) {
-            skipped += 1
-            continue
-          }
+        for (const item of seen.values()) {
           records.push({
             platform: "wa",
             chat_id: chatKey,
             chat_name: chatName,
             msg_id: null,
-            uid: fingerprint("wa", chatKey, parsed.iso, parsed.sender || "", text),
-            ts: parsed.iso,
+            uid: fingerprint("wa", chatKey, item.iso, item.sender || "", item.text),
+            ts: item.iso,
             sender_id: null,
-            sender_name: parsed.sender,
+            sender_name: item.sender,
             kind: "text",
-            text,
+            text: item.text,
             reply_to: null,
             attachments: [],
             captured_at: new Date().toISOString(),
             raw_ref: { source: "wa-web" },
           })
         }
+
         const dir = join(outputRootOf(cfg), slug)
         mkdirSync(dir, { recursive: true })
         const outFile = join(dir, "messages.jsonl")
         const { added, dup, upgraded } = upsertMessages(outFile, records)
-        record(policy, { op: "sync", chat: chatKey, result: `added:${added}` })
+        const normalized = normalizeFile(outFile)
+        const coveredFrom = oldest === null ? null : new Date(oldest).toISOString()
+        const statePath = join(dir, "sync-state.json")
+        writeFileSync(
+          statePath,
+          JSON.stringify(
+            {
+              ran_at: new Date().toISOString(),
+              chat: chatName,
+              target_from: new Date(targetFrom).toISOString(),
+              covered_from: coveredFrom,
+              complete,
+              stopped,
+              rounds,
+              scraped: records.length,
+            },
+            null,
+            2,
+          ),
+          "utf8",
+        )
+        record(policy, { op: "sync", chat: chatKey, result: `added:${added} complete:${complete}` })
         savePolicy(policy)
-        return { ok: true, chat: chatName, scrolls, rows_seen: seen.size, parsed: records.length, skipped, added, upgraded, duplicates: dup, path: outFile }
+        return {
+          ok: true,
+          chat: chatName,
+          complete,
+          stopped,
+          rounds,
+          covered_from: coveredFrom,
+          target_from: new Date(targetFrom).toISOString(),
+          scraped: records.length,
+          added,
+          merged_duplicates: normalized.merged,
+          upgraded,
+          duplicates: dup,
+          path: outFile,
+        }
       },
     }
   }
-
   if (kind === "chatProbe") {
     return {
       ...base,

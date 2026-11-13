@@ -926,6 +926,7 @@ function uiSnapshot(policy, cfg) {
   return {
     ok: true,
     output_root: outputRootOf(cfg),
+    inbox: inboxDirOf(cfg),
     credentials: credentialsOf(cfg).apiId.length > 0,
     ...policySnapshot(policy, cfg),
   }
@@ -984,6 +985,18 @@ async function handleUiRequest(req, res, ctx, cfg) {
       savePolicy(policy)
       return sendJson(res, 200, uiSnapshot(loadPolicy(), cfg))
     }
+    if (action === "setInbox") {
+      writeOverrides({ inboxDir: String(payload.value ?? "").trim() })
+      return sendJson(res, 200, uiSnapshot(loadPolicy(), cfg))
+    }
+
+    if (action === "scanInbox") {
+      const inbox = inboxDirOf(cfg)
+      const files = listInboxFiles(inbox)
+      const results = files.length === 0 ? [] : await importFiles(cfg, files)
+      return sendJson(res, 200, { ...uiSnapshot(loadPolicy(), cfg), scanned: files.length, results })
+    }
+
     if (action === "setRoot") {
       const value = String(payload.value ?? "").trim()
       writeOverrides({ outputRoot: value })
@@ -1067,6 +1080,13 @@ function chunkMessages(lines, limit) {
   return chunks
 }
 
+/** 在换行处对半切，供失败块重试用。 */
+function splitChunk(chunk) {
+  const mid = Math.floor(chunk.length / 2)
+  const at = chunk.indexOf(NL, mid)
+  if (at < 0) return [chunk.slice(0, mid), chunk.slice(mid)]
+  return [chunk.slice(0, at), chunk.slice(at + 1)]
+}
 const DIGEST_SYSTEM = "你是严谨的课程群纪要助手。只依据给定内容，不臆测、不补充原文没有的信息。"
 
 const ALERT_RULE = "alerts 是重要通知的原句（考试时间、上课形式或地点变动、作业与论文截止或提交方式、报名、取消延期、资料发布）。必须逐字照抄原文中的那一句，不改写、不翻译、不拼接；没有就空数组。"
@@ -1180,15 +1200,25 @@ async function digestOne(cfg, entry, hours, signal) {
   // 块越小，7B 越不容易产出畸形 JSON；宁可多几块，也不要整块丢失。
   const chunks = chunkMessages(chunkLines(messages), 3000)
   const concurrency = Math.max(1, Math.min(4, Number(cfg.digestConcurrency) || 2))
-  const extracts = await mapLimit(chunks, concurrency, async (chunk) => {
+  const extractChunk = async (chunk, depth) => {
     try {
-      return parseExtract(await ollamaGenerate(cfg, chunkPrompt(chunk), DIGEST_SYSTEM, signal))
+      const parsed = parseExtract(await ollamaGenerate(cfg, chunkPrompt(chunk), DIGEST_SYSTEM, signal))
+      if (parsed) return [parsed]
     } catch {
-      return null
+      // 落到重试
     }
-  })
-  const ok = extracts.filter(Boolean)
-  const failed = extracts.length - ok.length
+    if (depth > 0 && chunk.length > 1200) {
+      const [left, right] = splitChunk(chunk)
+      const a = await extractChunk(left, depth - 1)
+      const b = await extractChunk(right, depth - 1)
+      return [...a, ...b]
+    }
+    return []
+  }
+  const groups = await mapLimit(chunks, concurrency, (chunk) => extractChunk(chunk, 1))
+  const extracts = groups.flat()
+  const ok = extracts
+  const failed = groups.filter((group) => group.length === 0).length
   const verified = verifyAlerts(messages, extracts)
   const links = extractLinks(messages)
   const collect = (key) => ok.flatMap((item) => item[key]).slice(0, 40)
@@ -1207,7 +1237,7 @@ async function digestOne(cfg, entry, hours, signal) {
     timeMode === "snapshot"
       ? `无时间戳（导出未含时间）：覆盖该会话已导入的全部 ${messages.length} 条，按导入顺序`
       : `窗口 ${hours}h · 覆盖 ${messages.length} 条`
-  const body = [`# ${chatName} · 摘要`, "", `> 由 ${cfg.digestModel} 生成 · 输入 ${messages.length} 条 / ${chunks.length} 块 · 确定性校验通过 ${ok.length}/${chunks.length}`, `> ${scopeLine} · 生成时间 ${stamp}`, `> 来源 ${file}`, ""]
+  const body = [`# ${chatName} · 摘要`, "", `> 由 ${cfg.digestModel} 生成 · 输入 ${messages.length} 条 / ${chunks.length} 块 · 确定性校验通过 ${chunks.length - failed}/${chunks.length}`, `> ${scopeLine} · 生成时间 ${stamp}`, `> 来源 ${file}`, ""]
   body.push(`## 重要通知（原句照抄，未改写）${verified.alerts.length === 0 ? "（无）" : ""}`)
   for (const alert of verified.alerts) body.push(`- ${refLabel(alert)} ${alert.sender ?? "?"}: ${quoteLines(alert.text)}`)
   body.push("")
@@ -1234,7 +1264,7 @@ async function digestOne(cfg, entry, hours, signal) {
   writeFileSync(outPath, body.join(NL), "utf8")
   return {
     chat: chatName, path: outPath, messages: messages.length, chunks: chunks.length,
-    ok_chunks: ok.length, failed_chunks: failed, alerts: verified.alerts.length,
+    ok_chunks: chunks.length - failed, failed_chunks: failed, alerts: verified.alerts.length,
     rejected_alerts: verified.rejected, links: links.length, questions: verifiedQuestions.questions.length, time_mode: timeMode, chars: summary.length,
     alert_preview: verified.alerts.slice(0, 3).map((a) => `[${a.ref}] ${a.text}`.slice(0, 160)),
     preview: summary.slice(0, 400),
@@ -1353,6 +1383,80 @@ function appendEntries(file, records) {
   return { added: fresh.length, dup }
 }
 
+/** 导入一批文件：工具与页面共用同一段逻辑，不写第二套。 */
+async function importFiles(cfg, files) {
+  const policy = loadPolicy()
+  const results = []
+  for (const file of files) {
+    try {
+      const isJson = /\.json$/i.test(file)
+      const rawText = isJson ? readFileSync(file, "utf8") : null
+      let name = ""
+      if (isJson) {
+        try {
+          name = parseJsonExport(rawText, { platform: "wa", chatKey: "" }).chatName
+        } catch {
+          name = ""
+        }
+      }
+      if (name.length === 0) name = chatNameFromFile(basename(file))
+      const slug = slugOfName(name)
+      const chatKey = keyOf("wa", slug)
+      const existing = policy.chats[chatKey]
+      if (!existing || existing.decision !== "allow") {
+        const denied = existing && existing.decision === "deny"
+        policy.chats[chatKey] = {
+          ...(existing || {}),
+          platform: "wa",
+          id: slug,
+          name,
+          decision: denied ? "deny" : "pending",
+          seen_at: new Date().toISOString(),
+        }
+        record(policy, { op: "import", chat: chatKey, result: denied ? "denied" : "pending-approval" })
+        savePolicy(policy)
+        results.push({ file: basename(file), chat: name, status: denied ? "denied" : "pending-approval" })
+        continue
+      }
+      const text = isJson ? rawText : await readExportText(file)
+      const parsed = isJson ? parseJsonExport(text, { platform: "wa", chatKey }) : parseChatText(text, { platform: "wa", chatKey })
+      const capturedAt = parsed.exportedAt || null
+      const dir = join(outputRootOf(cfg), slug)
+      mkdirSync(dir, { recursive: true })
+      const outFile = join(dir, "messages.jsonl")
+      const recordsToWrite = parsed.messages.map((m) => ({
+        platform: "wa",
+        chat_id: chatKey,
+        chat_name: name,
+        msg_id: null,
+        uid: m.uid,
+        ts: m.ts,
+        sender_id: null,
+        sender_name: m.sender,
+        kind: m.kind,
+        text: m.text,
+        reply_to: null,
+        attachments: [],
+        captured_at: capturedAt,
+        raw_ref: { source: isJson ? "wa-json" : "wa-export" },
+      }))
+      const { added, dup } = appendEntries(outFile, recordsToWrite)
+      const processed = join(dirname(file), "processed")
+      try {
+        mkdirSync(processed, { recursive: true })
+        renameSync(file, join(processed, basename(file)))
+      } catch {
+        // 归档失败不影响导入结果
+      }
+      record(policy, { op: "import", chat: chatKey, result: `added:${added}` })
+      savePolicy(policy)
+      results.push({ file: basename(file), chat: name, status: "imported", parsed: parsed.stats, added, duplicates: dup, warnings: parsed.warnings.length, path: outFile })
+    } catch (error) {
+      results.push({ file: basename(file), status: "failed", error: String(error?.message ?? error).slice(0, 240) })
+    }
+  }
+  return results
+}
 function importTool(ctx, cfg) {
   return {
     name: "chat_import",
@@ -1382,76 +1486,7 @@ function importTool(ctx, cfg) {
       const inbox = inboxDirOf(cfg)
       const files = args?.path ? [String(args.path)] : listInboxFiles(inbox)
       if (files.length === 0) return { ok: true, inbox, results: [] }
-      const results = []
-      for (const file of files) {
-        try {
-          const isJson = /\.json$/i.test(file)
-          const rawText = isJson ? readFileSync(file, "utf8") : null
-          let name = ""
-          if (isJson) {
-            try {
-              name = parseJsonExport(rawText, { platform: "wa", chatKey: "" }).chatName
-            } catch {
-              name = ""
-            }
-          }
-          if (name.length === 0) name = chatNameFromFile(basename(file))
-          const slug = slugOfName(name)
-          const chatKey = keyOf("wa", slug)
-          const existing = policy.chats[chatKey]
-          if (!existing || existing.decision !== "allow") {
-            const denied = existing && existing.decision === "deny"
-            policy.chats[chatKey] = {
-              ...(existing || {}),
-              platform: "wa",
-              id: slug,
-              name,
-              decision: denied ? "deny" : "pending",
-              seen_at: new Date().toISOString(),
-            }
-            record(policy, { op: "import", chat: chatKey, result: denied ? "denied" : "pending-approval" })
-            savePolicy(policy)
-            results.push({ file: basename(file), chat: name, status: denied ? "denied" : "pending-approval" })
-            continue
-          }
-          const text = isJson ? rawText : await readExportText(file)
-          const parsed = isJson ? parseJsonExport(text, { platform: "wa", chatKey }) : parseChatText(text, { platform: "wa", chatKey })
-          const capturedAt = parsed.exportedAt || null
-          const dir = join(outputRootOf(cfg), slug)
-          mkdirSync(dir, { recursive: true })
-          const outFile = join(dir, "messages.jsonl")
-          const recordsToWrite = parsed.messages.map((m) => ({
-            platform: "wa",
-            chat_id: chatKey,
-            chat_name: name,
-            msg_id: null,
-            uid: m.uid,
-            ts: m.ts,
-            sender_id: null,
-            sender_name: m.sender,
-            kind: m.kind,
-            text: m.text,
-            reply_to: null,
-            attachments: [],
-            captured_at: capturedAt,
-            raw_ref: { source: isJson ? "wa-json" : "wa-export" },
-          }))
-          const { added, dup } = appendEntries(outFile, recordsToWrite)
-          const processed = join(dirname(file), "processed")
-          try {
-            mkdirSync(processed, { recursive: true })
-            renameSync(file, join(processed, basename(file)))
-          } catch {
-            // 归档失败不影响导入结果
-          }
-          record(policy, { op: "import", chat: chatKey, result: `added:${added}` })
-          savePolicy(policy)
-          results.push({ file: basename(file), chat: name, status: "imported", parsed: parsed.stats, added, duplicates: dup, warnings: parsed.warnings.length, path: outFile })
-        } catch (error) {
-          results.push({ file: basename(file), status: "failed", error: String(error?.message ?? error).slice(0, 240) })
-        }
-      }
-      return { ok: true, inbox, results }
+      return { ok: true, inbox, results: await importFiles(cfg, files) }
     },
   }
 }

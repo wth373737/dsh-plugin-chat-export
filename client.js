@@ -55,10 +55,14 @@ window.__ModuleLoader__.load({
       const [error, setError] = React.useState("")
       const [note, setNote] = React.useState("")
       const [root, setRoot] = React.useState("")
+      const [inbox, setInbox] = React.useState("")
+      const [scan, setScan] = React.useState(null)
 
       const apply = React.useCallback((data) => {
         setState(data)
         setRoot(data.output_root || "")
+        setInbox(data.inbox || "")
+        if (Array.isArray(data.results)) setScan(data.results)
       }, [])
 
       React.useEffect(() => {
@@ -111,6 +115,33 @@ window.__ModuleLoader__.load({
           h("div", { style: note ? S.note : S.meta }, note || "导出根目录决定 messages.jsonl 落在哪里；留空则用插件数据目录。"),
           error ? h("div", { style: S.err }, error) : null,
         ),
+        h(
+          "div",
+          { style: S.card },
+          h("div", { style: S.h2 }, "WhatsApp 导入"),
+          h("div", { style: S.meta }, "把 Web 端导出器生成的 .json / .zip / .txt 放进这个目录，然后点扫描导入。未批准的群只会登记为待批准。"),
+          h(
+            "div",
+            { style: S.row },
+            h("input", { style: S.input, value: inbox, placeholder: "收件箱目录，例如 E:\\下载", onChange: (e) => setInbox(e.target.value) }),
+            h("button", { style: S.btn, disabled: busy !== "", onClick: () => run({ action: "setInbox", value: inbox }, "收件箱已更新") }, "保存目录"),
+            h("button", { style: S.btn, disabled: busy !== "", onClick: () => run({ action: "scanInbox" }, "扫描完成") }, "扫描并导入"),
+          ),
+          scan === null
+            ? null
+            : scan.length === 0
+              ? h("div", { style: S.meta }, "收件箱里没有待导入的文件。")
+              : scan.map((item, index) =>
+                  h("div", { key: index, style: S.meta },
+                    (item.status === "imported"
+                      ? (item.chat + "：导入 " + item.added + " 条，重复 " + item.duplicates)
+                      : item.status === "failed"
+                        ? (item.file + "：失败 " + item.error)
+                        : (item.chat + "：" + (item.status === "denied" ? "黑名单，跳过" : "待批准，未导入"))),
+                  ),
+                ),
+        ),
+
         h(
           "div",
           { style: S.card },

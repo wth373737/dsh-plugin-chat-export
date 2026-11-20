@@ -1,7 +1,7 @@
 // Chat Export — settings page for the chat-export plugin.
 // Talks only to its own same-origin fenced route (custom header blocks CSRF).
 window.__ModuleLoader__.load({
-  id: "@local/chat-export",
+  id: "dsh-plugin-chat-export",
   factory(require) {
     const React = require("react")
     const h = React.createElement
@@ -211,7 +211,7 @@ window.__ModuleLoader__.load({
         ctx.effect(() =>
           ctx.slots.inject("settings.section", () =>
             ctx.slots.register(
-              { name: "settings.section", id: "chat-export", order: 66, label: "群聊导出", registrant: "@local/chat-export" },
+              { name: "settings.section", id: "chat-export", order: 66, label: "群聊导出", registrant: "dsh-plugin-chat-export" },
               Page,
             ),
           ),

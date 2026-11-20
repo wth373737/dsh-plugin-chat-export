@@ -1,18 +1,48 @@
 {
-  "name": "@local/chat-export",
-  "version": "0.1.0",
-  "private": true,
+  "name": "dsh-plugin-chat-export",
+  "version": "0.2.0",
   "type": "module",
-  "description": "Group-chat export with a whitelist/blacklist gate and local-model digests.",
+  "description": "Group-chat export for DeepSeek Harness: a per-chat allowlist gate, Telegram fetch and WhatsApp import, and local-model digests that keep verbatim quotes separate from generated summaries.",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "telegram",
+    "whatsapp",
+    "export",
+    "digest"
+  ],
+  "license": "MIT",
+  "author": "wth373737",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wth373737/dsh-plugin-chat-export.git"
+  },
+  "bugs": {
+    "url": "https://github.com/wth373737/dsh-plugin-chat-export/issues"
+  },
+  "homepage": "https://github.com/wth373737/dsh-plugin-chat-export#readme",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
-  "files": ["index.js", "client.js", "lib/*.js", "bridge/tg_bridge.py", "cordis.patch.yml", "locale/*.json", "icon.svg"],
+  "files": [
+    "index.js",
+    "client.js",
+    "lib/*.js",
+    "bridge/tg_bridge.py",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "immediately": true

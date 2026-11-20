@@ -9,6 +9,25 @@
 2. **门禁跟着能力走。** Telegram 的读取通道（`bridge/tg_bridge.py`）自己读策略库，只放行 `allow` 的会话——绕过插件直接调用它也读不到未批准的内容。
 3. **不确定就说不确定。** 摘要里哪些是原文、哪些是模型生成、覆盖是否完整，文件里都写明。
 
+## 安装
+
+**从 GitHub 安装（推荐）**
+
+在 DSH 里打开 **插件 → + 添加插件**，填：
+
+```text
+github:wth373737/dsh-plugin-chat-export
+```
+
+装完**重启一次** DSH —— 宿主半边与设置页都要重启后才加载。
+
+**额外依赖（只影响对应平台）**
+
+- Telegram：需要 Python + [Telethon](https://github.com/LonamiWebs/Telethon)，建议独立 venv；插件会自动探测与插件目录同级的 `venv-tg`，也可在设置里指定 `pythonPath`。
+- WhatsApp Web 抓取：插件自己启动一个独立的持久 Chrome，扫码登录一次即可；不装 Chrome 就只能走导出文件那条路。
+- 摘要：用本机 Ollama 生成，模型与地址在设置里配置。
+
+安装后所有会话都处于**未批准**状态，需要你在设置页或 `/chat-approve` 里逐个批准，Agent 自己批准不了。
 ## 工具
 
 | 工具 | 作用 |

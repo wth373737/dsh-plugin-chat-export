@@ -21,6 +21,9 @@
     "url": "https://github.com/wth373737/dsh-plugin-chat-export/issues"
   },
   "homepage": "https://github.com/wth373737/dsh-plugin-chat-export#readme",
+  "scripts": {
+    "check": "node tools/check-client-id.mjs"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
